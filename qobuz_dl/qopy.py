@@ -1,0 +1,190 @@
+import hashlib
+import logging
+import time
+from datetime import date
+
+import requests
+
+from qobuz_dl.exceptions import (
+    AuthenticationError,
+    IneligibleError,
+    InvalidAppIdError,
+    InvalidAppSecretError,
+    InvalidQuality,
+)
+from qobuz_dl.color import GREEN, YELLOW
+
+from rich.console import Console
+console = Console()
+
+RESET = "请运行 'qd -r' 重置您的凭证"
+
+logger = logging.getLogger(__name__)
+
+
+class Client:
+    def __init__(self, email, pwd, app_id, secrets, use_token, user_id, user_auth_token):
+        console.print(f"[dim]正在登录 API...[/dim]")
+        self.secrets = secrets
+        self.id = str(app_id)
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0",
+                "X-App-Id": self.id,
+                "Content-Type": "application/json;charset=UTF-8"
+
+            }
+        )
+        self.base = "https://www.qobuz.com/api.json/0.2/"
+        self.sec = None
+        self.auth(email, pwd, use_token, user_id, user_auth_token)
+        self.cfg_setup()
+
+    def api_call(self, epoint, **kwargs):
+        if epoint == "user/login":
+            if kwargs["use_token"] == "true":
+                params = {
+                    "user_id": kwargs["user_id"],
+                    "user_auth_token": kwargs["user_auth_token"]
+                }
+            else:
+                params = {
+                    "email": kwargs["email"],
+                    "password": kwargs["pwd"],
+                    "app_id": self.id,
+                }
+        elif epoint == "track/get":
+            params = {"track_id": kwargs["id"]}
+        elif epoint == "album/get":
+            params = {"album_id": kwargs["id"]}
+        elif epoint == "playlist/get":
+            params = {
+                "extra": "tracks",
+                "playlist_id": kwargs["id"],
+                "limit": 500,
+                "offset": kwargs["offset"],
+            }
+        elif epoint == "artist/get":
+            params = {
+                "app_id": self.id,
+                "artist_id": kwargs["id"],
+                "limit": 500,
+                "offset": kwargs["offset"],
+                "extra": "albums",
+            }
+        elif epoint == "label/get":
+            params = {
+                "label_id": kwargs["id"],
+                "limit": 500,
+                "offset": kwargs["offset"],
+                "extra": "albums",
+            }
+        elif epoint == "favorite/getUserFavorites":
+            unix = time.time()
+            r_sig = "favoritegetUserFavorites" + str(unix) + kwargs["sec"]
+            r_sig_hashed = hashlib.md5(r_sig.encode("utf-8")).hexdigest()
+            params = {
+                "app_id": self.id,
+                "user_auth_token": self.uat,
+                "type": "albums",
+                "request_ts": unix,
+                "request_sig": r_sig_hashed,
+            }
+        elif epoint == "track/getFileUrl":
+            unix = time.time()
+            track_id = kwargs["id"]
+            fmt_id = kwargs["fmt_id"]
+            if int(fmt_id) not in (5, 6, 7, 27):
+                raise InvalidQuality("画质 ID 无效")
+            r_sig = "trackgetFileUrlformat_id{}intentstreamtrack_id{}{}{}".format(
+                fmt_id, track_id, unix, kwargs.get("sec", self.sec)
+            )
+            r_sig_hashed = hashlib.md5(r_sig.encode("utf-8")).hexdigest()
+            params = {
+                "request_ts": unix,
+                "request_sig": r_sig_hashed,
+                "track_id": track_id,
+                "format_id": fmt_id,
+                "intent": "stream",
+            }
+        else:
+            params = kwargs
+        r = self.session.get(self.base + epoint, params=params)
+        if epoint == "user/login":
+            if r.status_code == 401:
+                raise AuthenticationError("登录失败：Token 无效或过期。\n" + RESET)
+            elif r.status_code == 400:
+                raise InvalidAppIdError("API 错误：无效的 App ID。\n" + RESET)
+            else:
+                console.print(f"[green]登录成功！[/green]")
+        elif (
+            epoint in ["track/getFileUrl", "favorite/getUserFavorites"]
+            and r.status_code == 400
+        ):
+            raise InvalidAppSecretError(f"API 签名错误 (App Secret 可能已失效): {r.json()}.\n" + RESET)
+
+        r.raise_for_status()
+        return r.json()
+
+    def auth(self, email, pwd, use_token, user_id, user_auth_token):
+        usr_info = self.api_call("user/login", email=email, pwd=pwd, use_token=use_token, user_id=user_id, user_auth_token=user_auth_token)
+        if not usr_info["user"]["credential"]["parameters"]:
+            raise IneligibleError("您的账户似乎不是付费订阅账户，无法下载。")
+        self.uat = usr_info["user_auth_token"]
+        self.session.headers.update({"X-User-Auth-Token": self.uat})
+        self.label = usr_info["user"]["credential"]["parameters"]["short_label"]
+        self.expiry_date = date.fromisoformat(usr_info["user"]["subscription"]["end_date"])
+        console.print(f"[green]会员类型: {self.label} | 到期时间: {date.strftime(self.expiry_date, '%Y年%m月%d日')}[/]")
+
+    def multi_meta(self, epoint, key, id, type):
+        total = 1
+        offset = 0
+        while total > 0:
+            if type in ["tracks", "albums"]:
+                j = self.api_call(epoint, id=id, offset=offset, type=type)[type]
+            else:
+                j = self.api_call(epoint, id=id, offset=offset, type=type)
+            if offset == 0:
+                yield j
+                total = j[key] - 500
+            else:
+                yield j
+                total -= 500
+            offset += 500
+
+    def get_album_meta(self, id):
+        return self.api_call("album/get", id=id)
+
+    def get_track_meta(self, id):
+        return self.api_call("track/get", id=id)
+
+    def get_track_url(self, id, fmt_id):
+        return self.api_call("track/getFileUrl", id=id, fmt_id=fmt_id)
+
+    def get_artist_meta(self, id):
+        return self.multi_meta("artist/get", "albums_count", id, None)
+
+    def get_plist_meta(self, id):
+        return self.multi_meta("playlist/get", "tracks_count", id, None)
+
+    def get_label_meta(self, id):
+        return self.multi_meta("label/get", "albums_count", id, None)
+
+    # 移除了搜索相关函数，因为已经不需要了
+
+    def test_secret(self, sec):
+        try:
+            self.api_call("track/getFileUrl", id=5966783, fmt_id=5, sec=sec)
+            return True
+        except InvalidAppSecretError:
+            return False
+
+    def cfg_setup(self):
+        for secret in self.secrets:
+            if not secret: continue
+            if self.test_secret(secret):
+                self.sec = secret
+                break
+        if self.sec is None:
+            raise InvalidAppSecretError("无法找到有效的 App Secret，Qobuz 可能更新了加密算法。\n" + RESET)
